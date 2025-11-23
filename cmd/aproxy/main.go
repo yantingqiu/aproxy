@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"aproxy/internal/config"
 	"aproxy/internal/pool"
 	"aproxy/pkg/observability"
 	my "aproxy/pkg/protocol/mysql"
+	"aproxy/pkg/replication"
+	"aproxy/pkg/reqtrack"
 	"aproxy/pkg/schema"
 	"aproxy/pkg/session"
 	"aproxy/pkg/sqlrewrite"
@@ -104,7 +107,37 @@ func main() {
 	sessionMgr := session.NewManager()
 	rewriter := sqlrewrite.NewRewriter(cfg.SQLRewrite.Enabled)
 
-	handler := my.NewHandler(pgPool, sessionMgr, rewriter, metrics, logger, cfg.SQLRewrite.DebugSQL)
+	// Enable debug timing via environment variable APROXY_DEBUG_REWRITE_TIMING=1
+	// This helps identify slow SQL rewrites and validate the large SQL threshold
+	if os.Getenv("APROXY_DEBUG_REWRITE_TIMING") == "1" {
+		rewriter.EnableDebugTiming(10 * time.Millisecond) // Log rewrites slower than 10ms
+		logger.Info("SQL rewrite timing debug enabled")
+	}
+
+	// Initialize replication server if configured
+	var replServer *replication.Server
+	if cfg.Binlog.Enabled {
+		replCfg := &replication.ServerConfig{
+			Enabled:    true,
+			ServerID:   1,
+			PGHost:     cfg.Postgres.Host,
+			PGPort:     cfg.Postgres.Port,
+			PGUser:     cfg.Postgres.User,
+			PGPassword: cfg.Postgres.Password,
+			PGDatabase: cfg.Postgres.Database,
+		}
+		var err error
+		replServer, err = replication.NewServer(replCfg, logger.Logger)
+		if err != nil {
+			logger.Error("Failed to initialize replication server", zap.Error(err))
+		} else {
+			logger.Info("MySQL binlog replication server initialized",
+				zap.Uint32("server_id", replCfg.ServerID),
+			)
+		}
+	}
+
+	handler := my.NewHandler(pgPool, sessionMgr, rewriter, metrics, logger, cfg.SQLRewrite.DebugSQL, replServer)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 
@@ -122,6 +155,12 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK"))
 		})
+
+		// Debug endpoints for monitoring slow requests
+		// GET /debug/slow-requests?threshold=1s - returns requests running longer than threshold
+		// GET /debug/requests - returns all in-flight requests
+		http.HandleFunc("/debug/slow-requests", reqtrack.HTTPHandler())
+		http.HandleFunc("/debug/requests", reqtrack.AllRequestsHandler())
 
 		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
 			logger.Error("Metrics server error", zap.Error(err))

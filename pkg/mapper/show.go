@@ -49,6 +49,10 @@ func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, s
 		return se.showVariables(ctx, conn, sql)
 	}
 
+	if strings.HasPrefix(upperSQL, "SHOW GLOBAL VARIABLES") {
+		return se.showGlobalVariables(ctx, conn, sql)
+	}
+
 	if strings.HasPrefix(upperSQL, "SHOW WARNINGS") {
 		return se.showWarnings(ctx, conn)
 	}
@@ -339,4 +343,53 @@ func (se *ShowEmulator) HandleUseCommand(ctx context.Context, conn *pgx.Conn, sq
 
 	_, err := conn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", dbName))
 	return err
+}
+
+// showGlobalVariables handles SHOW GLOBAL VARIABLES queries
+// This is needed for MySQL replication clients like go-mysql/canal
+func (se *ShowEmulator) showGlobalVariables(ctx context.Context, conn *pgx.Conn, sql string) (pgx.Rows, error) {
+	upperSQL := strings.ToUpper(sql)
+
+	// Handle LIKE patterns for specific variables
+	if strings.Contains(upperSQL, "LIKE") {
+		parts := strings.Split(upperSQL, "LIKE")
+		if len(parts) > 1 {
+			pattern := strings.TrimSpace(parts[1])
+			pattern = strings.Trim(pattern, "'\"")
+			pattern = strings.ToLower(pattern)
+			pattern = strings.ReplaceAll(pattern, "%", "")
+
+			// Return MySQL-compatible values for binlog replication
+			switch pattern {
+			case "binlog_format":
+				return conn.Query(ctx, `SELECT 'binlog_format' AS "Variable_name", 'ROW' AS "Value"`)
+			case "binlog_row_image":
+				return conn.Query(ctx, `SELECT 'binlog_row_image' AS "Variable_name", 'FULL' AS "Value"`)
+			case "server_id":
+				return conn.Query(ctx, `SELECT 'server_id' AS "Variable_name", '1' AS "Value"`)
+			case "server_uuid":
+				return conn.Query(ctx, `SELECT 'server_uuid' AS "Variable_name", '38db14f0-9bcc-487a-8001-9bcc38db18d8' AS "Value"`)
+			case "gtid_mode":
+				return conn.Query(ctx, `SELECT 'gtid_mode' AS "Variable_name", 'OFF' AS "Value"`)
+			case "log_bin":
+				return conn.Query(ctx, `SELECT 'log_bin' AS "Variable_name", 'ON' AS "Value"`)
+			case "binlog_checksum":
+				return conn.Query(ctx, `SELECT 'binlog_checksum' AS "Variable_name", 'CRC32' AS "Value"`)
+			}
+		}
+	}
+
+	// Default: return common MySQL global variables
+	query := `
+		SELECT 'binlog_format' AS "Variable_name", 'ROW' AS "Value"
+		UNION ALL SELECT 'binlog_row_image', 'FULL'
+		UNION ALL SELECT 'server_id', '1'
+		UNION ALL SELECT 'log_bin', 'ON'
+		UNION ALL SELECT 'gtid_mode', 'OFF'
+		UNION ALL SELECT 'binlog_checksum', 'CRC32'
+		UNION ALL SELECT 'max_allowed_packet', '67108864'
+		UNION ALL SELECT 'character_set_server', 'utf8mb4'
+		UNION ALL SELECT 'collation_server', 'utf8mb4_general_ci'
+	`
+	return conn.Query(ctx, query)
 }

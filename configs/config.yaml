@@ -33,10 +33,10 @@ security:
 sql_rewrite:
   enabled: true
   custom_rules: ""
-  debug_sql: false # Enable to log all SQL queries (original MySQL and converted PostgreSQL)
+  debug_sql: true # Enable to log all SQL queries (original MySQL and converted PostgreSQL)
 
 observability:
-  metrics_port: 9090
+  metrics_port: 9091
   log_level: "info" # debug, info, warn, error
   log_format: "json" # json or console
   enable_query_log: false
@@ -49,3 +49,16 @@ schema_cache:
   ttl: 5m # Cache TTL for table schema information
   max_entries: 100000
   invalidate_on_ddl: true # Automatically invalidate cache on CREATE/ALTER/DROP TABLE
+
+binlog:
+  enabled: true # Enable MySQL-like binary logging
+  dir: "./data/binlog" # Directory for binlog files
+  max_file_size: 104857600 # 100MB - rotate when file exceeds this size
+  max_files: 10 # Keep at most this many binlog files
+  sync_mode: "async" # async, sync, or fsync
+  format: "json" # json or binary
+  flush_interval: 1s # Flush buffer to disk interval
+  buffer_size: 65536 # 64KB write buffer
+  log_ddl: true # Log DDL statements (CREATE, ALTER, DROP)
+  log_dml: true # Log DML statements (INSERT, UPDATE, DELETE)
+  log_select: false # Log SELECT statements (usually disabled)
