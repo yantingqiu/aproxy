@@ -118,22 +118,31 @@ func main() {
 	var replServer *replication.Server
 	if cfg.Binlog.Enabled {
 		replCfg := &replication.ServerConfig{
-			Enabled:    true,
-			ServerID:   1,
-			PGHost:     cfg.Postgres.Host,
-			PGPort:     cfg.Postgres.Port,
-			PGUser:     cfg.Postgres.User,
-			PGPassword: cfg.Postgres.Password,
-			PGDatabase: cfg.Postgres.Database,
+			Enabled:           true,
+			ServerID:          1,
+			PGHost:            cfg.Postgres.Host,
+			PGPort:            cfg.Postgres.Port,
+			PGUser:            cfg.Postgres.User,
+			PGPassword:        cfg.Postgres.Password,
+			PGDatabase:        cfg.Postgres.Database,
+			PGSlotName:        "aproxy_cdc",
+			PGPublicationName: "aproxy_pub",
+			BinlogFilename:    "mysql-bin.000001",
+			BinlogPosition:    4,
 		}
 		var err error
-		replServer, err = replication.NewServer(replCfg, logger.Logger)
+		replServer, err = replication.NewServer(replCfg, logger.Logger, metrics)
 		if err != nil {
 			logger.Error("Failed to initialize replication server", zap.Error(err))
 		} else {
-			logger.Info("MySQL binlog replication server initialized",
-				zap.Uint32("server_id", replCfg.ServerID),
-			)
+			// Start the replication server to begin streaming PostgreSQL changes
+			if err := replServer.Start(); err != nil {
+				logger.Error("Failed to start replication server", zap.Error(err))
+			} else {
+				logger.Info("MySQL binlog replication server started",
+					zap.Uint32("server_id", replCfg.ServerID),
+				)
+			}
 		}
 	}
 

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"aproxy/pkg/observability"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"go.uber.org/zap"
@@ -40,21 +41,43 @@ type ServerConfig struct {
 	// Binlog settings
 	BinlogFilename string `yaml:"binlog_filename"` // e.g., "mysql-bin.000001"
 	BinlogPosition uint32 `yaml:"binlog_position"`
+
+	// BackpressureTimeout is the maximum time to wait when event channel is full
+	// before dropping events. Supports Go duration format: 30m, 1h, 10m, etc.
+	// Default: 30 minutes
+	BackpressureTimeout time.Duration `yaml:"backpressure_timeout"`
+
+	// Checkpoint settings for LSN persistence
+	CheckpointFile     string        `yaml:"checkpoint_file"`     // File path to store LSN checkpoint
+	CheckpointInterval time.Duration `yaml:"checkpoint_interval"` // Interval to save checkpoint (default: 10s)
+
+	// Reconnect settings
+	ReconnectEnabled     bool          `yaml:"reconnect_enabled"`      // Enable auto-reconnect on connection loss
+	ReconnectMaxRetries  int           `yaml:"reconnect_max_retries"`  // Max reconnect attempts (0 = unlimited)
+	ReconnectInitialWait time.Duration `yaml:"reconnect_initial_wait"` // Initial wait before reconnect
+	ReconnectMaxWait     time.Duration `yaml:"reconnect_max_wait"`     // Max wait between reconnects
 }
 
 // DefaultServerConfig returns default configuration
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Enabled:           false,
-		ServerID:          1,
-		PGHost:            "localhost",
-		PGPort:            5432,
-		PGDatabase:        "postgres",
-		PGUser:            "postgres",
-		PGSlotName:        "aproxy_cdc",
-		PGPublicationName: "aproxy_pub",
-		BinlogFilename:    "mysql-bin.000001",
-		BinlogPosition:    4,
+		Enabled:              false,
+		ServerID:             1,
+		PGHost:               "localhost",
+		PGPort:               5432,
+		PGDatabase:           "postgres",
+		PGUser:               "postgres",
+		PGSlotName:           "aproxy_cdc",
+		PGPublicationName:    "aproxy_pub",
+		BinlogFilename:       "mysql-bin.000001",
+		BinlogPosition:       4,
+		BackpressureTimeout:  30 * time.Minute,  // 30 minutes default
+		CheckpointFile:       "./data/cdc_checkpoint.json",
+		CheckpointInterval:   10 * time.Second,  // Save checkpoint every 10 seconds
+		ReconnectEnabled:     true,              // Enable auto-reconnect by default
+		ReconnectMaxRetries:  0,                 // Unlimited retries
+		ReconnectInitialWait: 1 * time.Second,   // Start with 1 second
+		ReconnectMaxWait:     30 * time.Second,  // Max 30 seconds between retries
 	}
 }
 
@@ -62,12 +85,17 @@ func DefaultServerConfig() *ServerConfig {
 type Server struct {
 	config   *ServerConfig
 	logger   *zap.Logger
+	metrics  *observability.Metrics
 	mu       sync.RWMutex
 
 	// Binlog state
 	position     mysql.Position
 	serverID     uint32
 	serverUUID   string
+
+	// GTID state
+	gtidEnabled   bool
+	transactionID uint64 // Monotonically increasing transaction ID
 
 	// Connected dump clients
 	clients     map[uint32]*DumpClient
@@ -124,7 +152,30 @@ const (
 	ChangeTypeBegin
 	ChangeTypeCommit
 	ChangeTypeDDL
+	ChangeTypeTruncate
 )
+
+// changeTypeToString converts ChangeType to string for logging
+func changeTypeToString(ct ChangeType) string {
+	switch ct {
+	case ChangeTypeInsert:
+		return "INSERT"
+	case ChangeTypeUpdate:
+		return "UPDATE"
+	case ChangeTypeDelete:
+		return "DELETE"
+	case ChangeTypeBegin:
+		return "BEGIN"
+	case ChangeTypeCommit:
+		return "COMMIT"
+	case ChangeTypeDDL:
+		return "DDL"
+	case ChangeTypeTruncate:
+		return "TRUNCATE"
+	default:
+		return "UNKNOWN"
+	}
+}
 
 // Column represents a table column
 type Column struct {
@@ -135,7 +186,7 @@ type Column struct {
 }
 
 // NewServer creates a new binlog replication server
-func NewServer(config *ServerConfig, logger *zap.Logger) (*Server, error) {
+func NewServer(config *ServerConfig, logger *zap.Logger, metrics *observability.Metrics) (*Server, error) {
 	if config == nil {
 		config = DefaultServerConfig()
 	}
@@ -147,14 +198,17 @@ func NewServer(config *ServerConfig, logger *zap.Logger) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		config:    config,
-		logger:    logger,
-		serverID:  config.ServerID,
-		serverUUID: generateUUID(),
-		clients:   make(map[uint32]*DumpClient),
-		eventChan: make(chan *ChangeEvent, 10000),
-		ctx:       ctx,
-		cancel:    cancel,
+		config:        config,
+		logger:        logger,
+		metrics:       metrics,
+		serverID:      config.ServerID,
+		serverUUID:    generateUUID(),
+		gtidEnabled:   true, // Enable GTID by default
+		transactionID: 0,
+		clients:       make(map[uint32]*DumpClient),
+		eventChan:     make(chan *ChangeEvent, 10000),
+		ctx:           ctx,
+		cancel:        cancel,
 		position: mysql.Position{
 			Name: config.BinlogFilename,
 			Pos:  config.BinlogPosition,
@@ -164,6 +218,7 @@ func NewServer(config *ServerConfig, logger *zap.Logger) (*Server, error) {
 	logger.Info("Binlog replication server initialized",
 		zap.Uint32("server_id", s.serverID),
 		zap.String("server_uuid", s.serverUUID),
+		zap.Bool("gtid_enabled", s.gtidEnabled),
 	)
 
 	return s, nil
@@ -180,7 +235,7 @@ func (s *Server) Start() error {
 	}
 
 	// Start PostgreSQL logical replication streamer
-	streamer, err := NewPGStreamer(s.config, s.logger, s.eventChan)
+	streamer, err := NewPGStreamer(s.config, s.logger, s.metrics, s.eventChan)
 	if err != nil {
 		s.running.Store(false)
 		return fmt.Errorf("failed to create PG streamer: %w", err)
@@ -246,6 +301,11 @@ func (s *Server) HandleBinlogDump(conn net.Conn, serverID uint32, pos mysql.Posi
 	s.clients[clientID] = client
 	s.clientsMu.Unlock()
 
+	// Track connected clients
+	if s.metrics != nil {
+		s.metrics.IncCDCConnectedClients()
+	}
+
 	s.logger.Info("New dump client connected",
 		zap.Uint32("client_id", clientID),
 		zap.Uint32("server_id", serverID),
@@ -287,6 +347,21 @@ func (s *Server) processChangeEvent(event *ChangeEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Track event metrics
+	if s.metrics != nil {
+		s.metrics.IncCDCEvents(changeTypeToString(event.Type))
+		s.metrics.SetCDCLastLSN(float64(event.LSN))
+	}
+
+	// Debug: log change event details
+	s.logger.Debug("Processing change event",
+		zap.String("type", changeTypeToString(event.Type)),
+		zap.String("schema", event.Schema),
+		zap.String("table", event.Table),
+		zap.Int("columns", len(event.Columns)),
+		zap.Any("newValues", event.NewValues),
+	)
+
 	// Convert to MySQL binlog events
 	binlogEvents := s.convertToMySQLEvents(event)
 
@@ -316,6 +391,14 @@ func (s *Server) convertToMySQLEvents(event *ChangeEvent) []*replication.BinlogE
 
 	switch event.Type {
 	case ChangeTypeBegin:
+		// Increment transaction ID for new transaction
+		s.transactionID++
+
+		// Add GTID event before BEGIN if enabled
+		if s.gtidEnabled {
+			events = append(events, s.createGTIDEvent())
+		}
+
 		// Create QueryEvent for BEGIN
 		events = append(events, s.createQueryEvent("BEGIN"))
 
@@ -333,8 +416,30 @@ func (s *Server) convertToMySQLEvents(event *ChangeEvent) []*replication.BinlogE
 		events = append(events, rowsEvt)
 
 	case ChangeTypeDDL:
+		// Increment transaction ID for DDL
+		s.transactionID++
+
+		// Add GTID event before DDL if enabled
+		if s.gtidEnabled {
+			events = append(events, s.createGTIDEvent())
+		}
+
 		// Create QueryEvent for DDL
 		events = append(events, s.createQueryEvent("-- DDL event"))
+
+	case ChangeTypeTruncate:
+		// Increment transaction ID for TRUNCATE
+		s.transactionID++
+
+		// Add GTID event before TRUNCATE if enabled
+		if s.gtidEnabled {
+			events = append(events, s.createGTIDEvent())
+		}
+
+		// Create QueryEvent for TRUNCATE TABLE
+		// MySQL binlog represents TRUNCATE as a QUERY_EVENT
+		query := fmt.Sprintf("TRUNCATE TABLE `%s`.`%s`", event.Schema, event.Table)
+		events = append(events, s.createQueryEvent(query))
 	}
 
 	return events
@@ -376,11 +481,76 @@ func (s *Server) createXIDEvent() *replication.BinlogEvent {
 	return event
 }
 
+// createGTIDEvent creates a MySQL GTID event
+// GTID format: server_uuid:transaction_id (e.g., "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1")
+func (s *Server) createGTIDEvent() *replication.BinlogEvent {
+	// Build GTID string: server_uuid:transaction_id
+	gtid := fmt.Sprintf("%s:%d", s.serverUUID, s.transactionID)
+
+	// Convert UUID string to 16-byte binary format
+	sid := uuidStringToBytes(s.serverUUID)
+
+	event := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			Timestamp: uint32(time.Now().Unix()),
+			EventType: replication.GTID_EVENT, // Event type 33
+			ServerID:  s.serverID,
+			LogPos:    s.position.Pos,
+		},
+		Event: &replication.GTIDEvent{
+			CommitFlag:     1,                        // 1 = committed transaction
+			SID:            sid,                      // Server UUID as 16-byte binary
+			GNO:            int64(s.transactionID),   // Transaction number (GTID sequence)
+			LastCommitted:  int64(s.transactionID - 1), // Previous transaction
+			SequenceNumber: int64(s.transactionID),   // Sequence number for parallel replication
+		},
+	}
+
+	s.logger.Debug("Created GTID event",
+		zap.String("gtid", gtid),
+		zap.Uint64("transaction_id", s.transactionID),
+	)
+
+	return event
+}
+
+// uuidStringToBytes converts a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) to 16 bytes
+func uuidStringToBytes(uuid string) []byte {
+	// Remove dashes and convert hex to bytes
+	cleaned := ""
+	for _, c := range uuid {
+		if c != '-' {
+			cleaned += string(c)
+		}
+	}
+
+	result := make([]byte, 16)
+	for i := 0; i < 16 && i*2+1 < len(cleaned); i++ {
+		var b byte
+		fmt.Sscanf(cleaned[i*2:i*2+2], "%02x", &b)
+		result[i] = b
+	}
+	return result
+}
+
 // createTableMapEvent creates a MySQL TableMapEvent
 func (s *Server) createTableMapEvent(event *ChangeEvent) *replication.BinlogEvent {
-	columnTypes := make([]byte, len(event.Columns))
+	columnCount := len(event.Columns)
+	columnTypes := make([]byte, columnCount)
+	columnMeta := make([]uint16, columnCount)
+	columnNames := make([][]byte, columnCount)
+	nullBitmap := make([]byte, (columnCount+7)/8)
+
 	for i, col := range event.Columns {
 		columnTypes[i] = col.Type
+		// Set metadata based on column type
+		columnMeta[i] = getColumnMeta(col.Type)
+		// Set column name
+		columnNames[i] = []byte(col.Name)
+		// Set nullable bit
+		if col.Nullable {
+			nullBitmap[i/8] |= 1 << uint(i%8)
+		}
 	}
 
 	evt := &replication.BinlogEvent{
@@ -395,20 +565,49 @@ func (s *Server) createTableMapEvent(event *ChangeEvent) *replication.BinlogEven
 			Schema:      []byte(event.Schema),
 			Table:       []byte(event.Table),
 			ColumnType:  columnTypes,
-			ColumnCount: uint64(len(event.Columns)),
+			ColumnMeta:  columnMeta,
+			ColumnCount: uint64(columnCount),
+			NullBitmap:  nullBitmap,
+			ColumnName:  columnNames, // Optional metadata: column names
 		},
 	}
 	return evt
 }
 
+// getColumnMeta returns the metadata for a MySQL column type
+func getColumnMeta(colType uint8) uint16 {
+	switch colType {
+	case mysql.MYSQL_TYPE_VARCHAR, mysql.MYSQL_TYPE_VAR_STRING:
+		return 65535 // max length for VARCHAR
+	case mysql.MYSQL_TYPE_STRING:
+		return 255 // max length for CHAR
+	case mysql.MYSQL_TYPE_BLOB:
+		return 2 // 2 bytes for length prefix (BLOB)
+	case mysql.MYSQL_TYPE_JSON:
+		return 4 // 4 bytes for length prefix
+	case mysql.MYSQL_TYPE_NEWDECIMAL:
+		return (10 << 8) | 2 // precision 10, scale 2
+	case mysql.MYSQL_TYPE_DATETIME2, mysql.MYSQL_TYPE_TIMESTAMP2, mysql.MYSQL_TYPE_TIME2:
+		return 0 // no fractional seconds
+	case mysql.MYSQL_TYPE_FLOAT:
+		return 4 // 4 bytes
+	case mysql.MYSQL_TYPE_DOUBLE:
+		return 8 // 8 bytes
+	default:
+		return 0 // no metadata needed
+	}
+}
+
 // createRowsEvent creates a MySQL RowsEvent
 func (s *Server) createRowsEvent(event *ChangeEvent) *replication.BinlogEvent {
 	var eventType replication.EventType
+	var needBitmap2 bool
 	switch event.Type {
 	case ChangeTypeInsert:
 		eventType = replication.WRITE_ROWS_EVENTv2
 	case ChangeTypeUpdate:
 		eventType = replication.UPDATE_ROWS_EVENTv2
+		needBitmap2 = true
 	case ChangeTypeDelete:
 		eventType = replication.DELETE_ROWS_EVENTv2
 	}
@@ -416,12 +615,60 @@ func (s *Server) createRowsEvent(event *ChangeEvent) *replication.BinlogEvent {
 	rows := make([][]interface{}, 0)
 	if event.Type == ChangeTypeUpdate {
 		// For UPDATE, include both old and new values
-		rows = append(rows, event.OldValues)
+		// If OldValues is nil (PostgreSQL REPLICA IDENTITY not FULL), use NewValues as fallback
+		oldVals := event.OldValues
+		if oldVals == nil {
+			oldVals = event.NewValues
+		}
+		rows = append(rows, oldVals)
 		rows = append(rows, event.NewValues)
 	} else if event.Type == ChangeTypeInsert {
 		rows = append(rows, event.NewValues)
 	} else {
-		rows = append(rows, event.OldValues)
+		// For DELETE, use OldValues if available, otherwise use NewValues
+		oldVals := event.OldValues
+		if oldVals == nil {
+			oldVals = event.NewValues
+		}
+		rows = append(rows, oldVals)
+	}
+
+	// Build column bitmap (all columns present)
+	columnCount := uint64(len(event.Columns))
+	bitmapSize := (int(columnCount) + 7) / 8
+	columnBitmap := make([]byte, bitmapSize)
+	for i := 0; i < bitmapSize; i++ {
+		columnBitmap[i] = 0xFF
+	}
+
+	// Build TableMapEvent reference for row encoding
+	columnTypes := make([]byte, len(event.Columns))
+	columnMeta := make([]uint16, len(event.Columns))
+	for i, col := range event.Columns {
+		columnTypes[i] = col.Type
+		columnMeta[i] = getColumnMeta(col.Type)
+	}
+	tableMap := &replication.TableMapEvent{
+		TableID:     event.TableID,
+		Schema:      []byte(event.Schema),
+		Table:       []byte(event.Table),
+		ColumnType:  columnTypes,
+		ColumnMeta:  columnMeta,
+		ColumnCount: columnCount,
+	}
+
+	rowsEvent := &replication.RowsEvent{
+		Version:       2,
+		TableID:       event.TableID,
+		Flags:         replication.RowsEventStmtEndFlag,
+		ColumnCount:   columnCount,
+		ColumnBitmap1: columnBitmap,
+		Rows:          rows,
+		Table:         tableMap,
+	}
+
+	if needBitmap2 {
+		rowsEvent.ColumnBitmap2 = columnBitmap
 	}
 
 	evt := &replication.BinlogEvent{
@@ -431,10 +678,7 @@ func (s *Server) createRowsEvent(event *ChangeEvent) *replication.BinlogEvent {
 			ServerID:  s.serverID,
 			LogPos:    s.position.Pos,
 		},
-		Event: &replication.RowsEvent{
-			TableID: event.TableID,
-			Rows:    rows,
-		},
+		Event: rowsEvent,
 	}
 	return evt
 }
@@ -608,12 +852,20 @@ func (s *Server) streamToClient(client *DumpClient) {
 // sendHeartbeat sends a heartbeat event to keep the connection alive
 func (s *Server) sendHeartbeat(client *DumpClient) error {
 	// Create HEARTBEAT_LOG_EVENT
-	header := make([]byte, 19)
-	binary.LittleEndian.PutUint32(header[0:4], uint32(time.Now().Unix()))
-	header[4] = byte(replication.HEARTBEAT_EVENT)
-	binary.LittleEndian.PutUint32(header[5:9], s.serverID)
+	// Format: header (19 bytes) + empty payload + checksum (4 bytes) = 23 bytes minimum
+	eventSize := uint32(19 + 4) // header + checksum
+	data := make([]byte, eventSize)
 
-	return s.sendBinlogPacketToClient(client, header)
+	// Header
+	binary.LittleEndian.PutUint32(data[0:4], uint32(time.Now().Unix()))
+	data[4] = byte(replication.HEARTBEAT_EVENT)
+	binary.LittleEndian.PutUint32(data[5:9], s.serverID)
+	binary.LittleEndian.PutUint32(data[9:13], eventSize)
+	binary.LittleEndian.PutUint32(data[13:17], s.position.Pos)
+	binary.LittleEndian.PutUint16(data[17:19], 0) // flags
+	// Checksum (4 bytes) - zeros
+
+	return s.sendBinlogPacketToClient(client, data)
 }
 
 // removeDumpClient removes a dump client
@@ -622,6 +874,12 @@ func (s *Server) removeDumpClient(clientID uint32) {
 	if client, ok := s.clients[clientID]; ok {
 		client.Conn.Close()
 		delete(s.clients, clientID)
+
+		// Track disconnected clients
+		if s.metrics != nil {
+			s.metrics.DecCDCConnectedClients()
+		}
+
 		s.logger.Info("Dump client disconnected",
 			zap.Uint32("client_id", clientID),
 			zap.Uint64("events_sent", client.EventsSent),
@@ -655,22 +913,9 @@ func generateUUID() string {
 	)
 }
 
-// encodeBinlogEvent encodes a binlog event to bytes
+// encodeBinlogEvent encodes a binlog event to bytes using the BinlogEncoder
+// MySQL binlog event format: [header (19 bytes)][payload][checksum (4 bytes)]
 func encodeBinlogEvent(event *replication.BinlogEvent) ([]byte, error) {
-	// Simplified encoding - in production would need full implementation
-	// For now, return the raw data if available
-	if event.RawData != nil {
-		return event.RawData, nil
-	}
-
-	// Create minimal header
-	header := make([]byte, 19)
-	binary.LittleEndian.PutUint32(header[0:4], event.Header.Timestamp)
-	header[4] = byte(event.Header.EventType)
-	binary.LittleEndian.PutUint32(header[5:9], event.Header.ServerID)
-	binary.LittleEndian.PutUint32(header[9:13], uint32(len(header)))
-	binary.LittleEndian.PutUint32(header[13:17], event.Header.LogPos)
-	binary.LittleEndian.PutUint16(header[17:19], event.Header.Flags)
-
-	return header, nil
+	encoder := NewBinlogEncoder()
+	return encoder.EncodeEvent(event)
 }

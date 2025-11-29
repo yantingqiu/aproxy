@@ -37,10 +37,10 @@ sql_rewrite:
 
 observability:
   metrics_port: 9091
-  log_level: "info" # debug, info, warn, error
+  log_level: "debug" # debug, info, warn, error
   log_format: "json" # json or console
-  enable_query_log: false
-  redact_parameters: true
+  enable_query_log: true
+  redact_parameters: false
   enable_tracing: false
   tracing_endpoint: "localhost:4318"
 
@@ -62,3 +62,18 @@ binlog:
   log_ddl: true # Log DDL statements (CREATE, ALTER, DROP)
   log_dml: true # Log DML statements (INSERT, UPDATE, DELETE)
   log_select: false # Log SELECT statements (usually disabled)
+
+cdc:
+  enabled: false # Enable CDC (MySQL binlog protocol) server
+  server_id: 1 # MySQL server ID for replication
+  backpressure_timeout: 30m # Max wait time when event channel full (supports: 30m, 1h, 10m, etc.)
+
+  # Checkpoint persistence for recovery
+  checkpoint_file: "./data/cdc_checkpoint.json" # File to store LSN checkpoint
+  checkpoint_interval: 10s # How often to save checkpoint
+
+  # Auto-reconnect settings
+  reconnect_enabled: true # Enable auto-reconnect on connection loss
+  reconnect_max_retries: 0 # Max reconnect attempts (0 = unlimited)
+  reconnect_initial_wait: 1s # Initial wait before reconnect
+  reconnect_max_wait: 30s # Max wait between reconnects (exponential backoff)

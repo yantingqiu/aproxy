@@ -17,7 +17,7 @@ help:
 	@echo "  clean              - Remove build artifacts"
 	@echo "  test               - Run all tests (unit + integration)"
 	@echo "  test-unit          - Run unit tests"
-	@echo "  test-integration   - Run integration tests (PG-supported features)"
+	@echo "  test-integration   - Run integration tests (including CDC/binlog tests)"
 	@echo "  test-pg-unsupported- Run tests for PG-unsupported MySQL features (most will skip)"
 	@echo "  bench              - Run benchmarks"
 	@echo "  tpcc               - Run industry-standard TPC-C benchmark (go-tpc)"
@@ -45,7 +45,7 @@ test-unit:
 	GOEXPERIMENT=$(GOEXPERIMENT) go test -v -race -coverprofile=coverage.out ./pkg/... ./internal/...
 
 test-integration: build
-	@echo "Running integration tests with GOEXPERIMENT=$(GOEXPERIMENT)..."
+	@echo "Running integration tests (including CDC) with GOEXPERIMENT=$(GOEXPERIMENT)..."
 	@echo "Starting aproxy service..."
 	@lsof -ti:3306 | xargs kill -9 2>/dev/null || true
 	@lsof -ti:9090 | xargs kill -9 2>/dev/null || true

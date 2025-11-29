@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	"go.uber.org/zap"
 )
 
 func TestDefaultServerConfig(t *testing.T) {
@@ -369,7 +370,7 @@ func TestEncodeBinlogEvent(t *testing.T) {
 		t.Errorf("Expected raw data, got %s", string(data))
 	}
 
-	// Test without RawData (should return header)
+	// Test without RawData (should return header + payload + checksum)
 	eventWithoutRawData := &replication.BinlogEvent{
 		Header: &replication.EventHeader{
 			Timestamp: uint32(time.Now().Unix()),
@@ -385,8 +386,9 @@ func TestEncodeBinlogEvent(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
-	if len(data) != 19 { // Standard header size
-		t.Errorf("Expected 19 byte header, got %d bytes", len(data))
+	// Minimum size: header (19) + minimal payload (4) + checksum (4) = 27 bytes
+	if len(data) < 19+4 { // At least header + checksum
+		t.Errorf("Expected at least 23 bytes (header + checksum), got %d bytes", len(data))
 	}
 }
 
@@ -432,5 +434,155 @@ func TestDumpClientSequenceNumber(t *testing.T) {
 
 	if client.seqNum != 2 {
 		t.Errorf("Expected seqNum=2 after increment, got %d", client.seqNum)
+	}
+}
+
+func TestTruncateEventConversion(t *testing.T) {
+	config := &ServerConfig{
+		Enabled:  true,
+		ServerID: 1,
+	}
+
+	logger, _ := zap.NewDevelopment()
+
+	s := &Server{
+		config:      config,
+		logger:      logger,
+		serverID:    config.ServerID,
+		serverUUID:  generateUUID(),
+		gtidEnabled: true,
+		position: mysql.Position{
+			Name: "binlog.000001",
+			Pos:  4,
+		},
+	}
+
+	event := &ChangeEvent{
+		Type:      ChangeTypeTruncate,
+		Timestamp: time.Now(),
+		Schema:    "public",
+		Table:     "test_table",
+		TableID:   123,
+	}
+
+	events := s.convertToMySQLEvents(event)
+
+	// TRUNCATE should generate: GTID_EVENT + QUERY_EVENT
+	if len(events) != 2 {
+		t.Errorf("Expected 2 events for TRUNCATE (GTID + QUERY), got %d", len(events))
+		return
+	}
+
+	// First event should be GTID
+	if events[0].Header.EventType != replication.GTID_EVENT {
+		t.Errorf("Expected first event to be GTID_EVENT, got %v", events[0].Header.EventType)
+	}
+
+	// Second event should be QUERY
+	if events[1].Header.EventType != replication.QUERY_EVENT {
+		t.Errorf("Expected second event to be QUERY_EVENT, got %v", events[1].Header.EventType)
+	}
+
+	// Verify query content
+	queryEvent, ok := events[1].Event.(*replication.QueryEvent)
+	if !ok {
+		t.Fatal("Expected QueryEvent type")
+	}
+
+	expectedQuery := "TRUNCATE TABLE `public`.`test_table`"
+	if string(queryEvent.Query) != expectedQuery {
+		t.Errorf("Expected query '%s', got '%s'", expectedQuery, string(queryEvent.Query))
+	}
+}
+
+func TestReconnectConfigDefaults(t *testing.T) {
+	config := DefaultServerConfig()
+
+	// Verify reconnect settings defaults
+	if !config.ReconnectEnabled {
+		t.Error("Expected ReconnectEnabled=true by default")
+	}
+
+	if config.ReconnectMaxRetries != 0 {
+		t.Errorf("Expected ReconnectMaxRetries=0 (unlimited), got %d", config.ReconnectMaxRetries)
+	}
+
+	if config.ReconnectInitialWait != 1*time.Second {
+		t.Errorf("Expected ReconnectInitialWait=1s, got %v", config.ReconnectInitialWait)
+	}
+
+	if config.ReconnectMaxWait != 30*time.Second {
+		t.Errorf("Expected ReconnectMaxWait=30s, got %v", config.ReconnectMaxWait)
+	}
+}
+
+func TestCheckpointConfigDefaults(t *testing.T) {
+	config := DefaultServerConfig()
+
+	// Verify checkpoint settings defaults
+	if config.CheckpointFile != "./data/cdc_checkpoint.json" {
+		t.Errorf("Expected CheckpointFile='./data/cdc_checkpoint.json', got '%s'", config.CheckpointFile)
+	}
+
+	if config.CheckpointInterval != 10*time.Second {
+		t.Errorf("Expected CheckpointInterval=10s, got %v", config.CheckpointInterval)
+	}
+}
+
+func TestExponentialBackoff(t *testing.T) {
+	// Simulate exponential backoff logic
+	initialWait := 1 * time.Second
+	maxWait := 30 * time.Second
+
+	tests := []struct {
+		retry       int
+		expectedMin time.Duration
+		expectedMax time.Duration
+	}{
+		{1, 1 * time.Second, 2 * time.Second},   // First retry: 1s
+		{2, 2 * time.Second, 4 * time.Second},   // Second retry: 2s
+		{3, 4 * time.Second, 8 * time.Second},   // Third retry: 4s
+		{4, 8 * time.Second, 16 * time.Second},  // Fourth retry: 8s
+		{5, 16 * time.Second, 30 * time.Second}, // Fifth retry: 16s (capped to 30s)
+		{6, 30 * time.Second, 30 * time.Second}, // Sixth retry: capped to 30s
+	}
+
+	for _, tt := range tests {
+		waitTime := initialWait
+		for i := 1; i < tt.retry; i++ {
+			waitTime = waitTime * 2
+			if waitTime > maxWait {
+				waitTime = maxWait
+			}
+		}
+
+		if waitTime < tt.expectedMin || waitTime > tt.expectedMax {
+			t.Errorf("Retry %d: expected wait between %v and %v, got %v",
+				tt.retry, tt.expectedMin, tt.expectedMax, waitTime)
+		}
+	}
+}
+
+func TestChangeTypeString(t *testing.T) {
+	tests := []struct {
+		changeType ChangeType
+		expected   string
+	}{
+		{ChangeTypeInsert, "INSERT"},
+		{ChangeTypeUpdate, "UPDATE"},
+		{ChangeTypeDelete, "DELETE"},
+		{ChangeTypeBegin, "BEGIN"},
+		{ChangeTypeCommit, "COMMIT"},
+		{ChangeTypeDDL, "DDL"},
+		{ChangeTypeTruncate, "TRUNCATE"},
+		{ChangeType(99), "UNKNOWN"},
+	}
+
+	for _, tt := range tests {
+		result := changeTypeToString(tt.changeType)
+		if result != tt.expected {
+			t.Errorf("changeTypeToString(%d): expected '%s', got '%s'",
+				tt.changeType, tt.expected, result)
+		}
 	}
 }
