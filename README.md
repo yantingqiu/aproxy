@@ -60,7 +60,7 @@ A high-performance MySQL protocol proxy that transparently translates MySQL clie
 │                      │                                             │
 │ ┌────────────────────▼─────────────────────────────────────────┐   │
 │ │  Schema Cache (pkg/schema) - Global Cache with Generics      │   │
-│ │  - AUTO_INCREMENT column detection (database.table key)      │   │
+│ │  - AUTO_INCREMENT column detection (schema.table key)        │   │
 │ │  - Generic sync.Map (zero type assertion overhead)           │   │
 │ │  - TTL-based expiration (5min default, configurable)         │   │
 │ │  - DDL auto-invalidation (CREATE/ALTER/DROP TABLE)           │   │
@@ -212,8 +212,8 @@ MySQL Client Receives Response
 - ✅ **Global Schema Cache**: Generic sync.Map-based cache with DDL auto-invalidation (99% query reduction)
 - ✅ **Type Mapping**: Automatic conversion between MySQL and PostgreSQL data types
 - ✅ **Error Mapping**: Maps PostgreSQL error codes to MySQL error codes
-- ✅ **SHOW/DESCRIBE Emulation**: Simulates MySQL metadata commands
-- ✅ **Connection Pooling**: Supports session affinity and pooled modes
+- ✅ **SHOW/DESCRIBE Emulation**: Simulates MySQL metadata commands, including logical `SHOW DATABASES`
+- ✅ **Connection Pooling**: Supports session affinity and pooled modes; schema mapping requires `session_affinity`
 - ✅ **MySQL CDC (Binlog)**: Stream PostgreSQL changes as MySQL binlog events to MySQL replication clients
 - ✅ **Observability**: Prometheus metrics, structured logging, health checks
 - ✅ **High Performance**: Target 10,000+ QPS, P99 latency < 50ms
@@ -370,7 +370,7 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 - ✅ COM_INIT_DB (change database)
 
 ### Metadata Commands
-- ✅ SHOW DATABASES
+- ✅ SHOW DATABASES (returns logical database names)
 - ✅ SHOW TABLES
 - ✅ SHOW COLUMNS
 - ✅ DESCRIBE/DESC
@@ -739,7 +739,7 @@ AProxy includes **69 integration test cases** covering common MySQL syntax and o
 - Rollback transaction
 
 #### Metadata Commands
-- SHOW DATABASES
+- SHOW DATABASES (logical database names)
 - SHOW TABLES
 
 #### Data Type Tests
@@ -920,10 +920,19 @@ For a detailed list of limitations, see [DESIGN.md](docs/DESIGN.md)
 | `schema_cache.ttl`               | Cache TTL                       | 5m                             |
 | `schema_cache.max_entries`       | Max cache entries               | 100000                         |
 | `schema_cache.invalidate_on_ddl` | Auto-invalidate on DDL          | true                           |
+| `database_mapping.default_schema` | Default PostgreSQL schema for sessions without a logical database | public |
+| `database_mapping.fallback_to_public` | Append `public` to `search_path` compatibility fallback | false |
 | `cdc.enabled`                    | Enable CDC server               | false                          |
 | `cdc.checkpoint_file`            | LSN checkpoint file             | ./data/cdc_checkpoint.json     |
 | `cdc.reconnect_enabled`          | Auto-reconnect on connection loss | true                         |
 | `observability.log_level`        | Log level                       | info                           |
+
+### Schema Mapping Semantics
+
+- `postgres.database` remains the fixed PostgreSQL physical database for the proxy.
+- In `session_affinity` mode, a MySQL logical database maps to PostgreSQL schema state via `USE db` / `COM_INIT_DB`.
+- `SHOW DATABASES` returns logical database names, not PostgreSQL physical database names.
+- `database_mapping.fallback_to_public` defaults to `false`, so strict mode does not silently fall back to `public`.
 
 For complete configuration options, see [config.yaml](configs/config.yaml)
 
